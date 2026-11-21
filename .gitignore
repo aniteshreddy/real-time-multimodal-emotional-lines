@@ -1,0 +1,17 @@
+# data, caches, artifacts
+data/
+artifacts/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+
+# notebooks
+.ipynb_checkpoints/
+
+# models / caches
+*.pt
+*.npz

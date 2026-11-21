@@ -1,0 +1,36 @@
+[project]
+name = "meld-robot"
+version = "0.1.0"
+description = "Real-time tri-modal emotion understanding for a companion robot, built on MELD (lean build: DistilRoBERTa + Wav2Vec2 + MediaPipe + fusion head + Qwen2.5-1.5B responder)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.46",
+    "accelerate>=1.1",
+    "huggingface_hub>=0.26",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "opencv-python-headless>=4.10",
+    "mediapipe>=0.10.14",
+    "pandas>=2.2",
+    "numpy>=1.26,<2.3",
+    "scikit-learn>=1.5",
+    "matplotlib>=3.9",
+    "tqdm>=4.66",
+    "jupyter>=1.1",
+    "ipywidgets>=8.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meld_robot"]
+
+[dependency-groups]
+dev = []
+
+[tool.uv]
+package = true
