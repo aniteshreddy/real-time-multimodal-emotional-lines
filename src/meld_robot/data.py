@@ -2,15 +2,18 @@
 
 Light pandas logic is importable without torch/transformers so the data
 layer can be smoke-tested independently of the GPU stack.
+
+Audio extraction is pure Python: PyAV (wheel-bundled FFmpeg libraries)
+decodes mp4 audio in-process; soundfile writes 16 kHz mono wavs. No system
+ffmpeg, no subprocess, no sudo. Corrupt source clips (MELD ships a few) are
+skipped and reported; the training pipeline treats them as missing audio.
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
 import tarfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -20,27 +23,22 @@ from . import config
 
 @dataclass
 class Utterance:
-    uid: str  # e.g. "dia0_utt0"
+    uid: str
     split: str
     text: str
     speaker: str
     emotion: str
     sentiment: str
-    video_path: Optional[Path]
-    wav_path: Path  # extracted 16 kHz mono wav (created by ensure_audio_wavs)
+    wav_path: Path
+    video_path: Optional[Path] = None
 
 
-# ---------------------------------------------------------------------------
-# Download / extract
-# ---------------------------------------------------------------------------
 def download_and_extract_meld(force: bool = False) -> Path:
-    """Download MELD.Raw.tar.gz (~10.9 GB) from the official Hugging Face
-    mirror and extract it into data/MELD.Raw. Skips if already present."""
-    if (config.RAW_DIR / "train").exists() and not force:
+    if sorted(config.RAW_DIR.glob("*_sent_emo.csv")) and not force:
         print(f"MELD already extracted at {config.RAW_DIR}, skipping download.")
         return config.RAW_DIR
 
-    from huggingface_hub import hf_hub_download  # heavy dep, imported lazily
+    from huggingface_hub import hf_hub_download
 
     archive = hf_hub_download(
         repo_id=config.MELD_HF_REPO,
@@ -54,11 +52,7 @@ def download_and_extract_meld(force: bool = False) -> Path:
     return config.RAW_DIR
 
 
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
 def _find_csv(split: str) -> Path:
-    """MELD raw layout differs slightly across releases; glob defensively."""
     for pattern in (
         config.SPLIT_CSV_PATTERNS[split],
         f"{split}*_sent_emo.csv",
@@ -73,17 +67,25 @@ def _find_csv(split: str) -> Path:
     )
 
 
+CLIP_DIR_FALLBACKS = {
+    "train": ("train_splits",),
+    "dev": ("dev_splits_complete", "dev_splits"),
+    "test": ("output_repeated_splits_test",),
+}
+
+
 def clip_dir_for(split: str) -> Optional[Path]:
     cand = config.SPLIT_CLIP_DIRS.get(split)
     if cand and cand.exists():
         return cand
-    for sub in sorted(config.RAW_DIR.rglob("*.mp4")):
-        return sub.parent  # first mp4 found defines the clip dir
+    for name in CLIP_DIR_FALLBACKS.get(split, ()):
+        hits = sorted(p for p in config.RAW_DIR.rglob(name) if p.is_dir())
+        if hits:
+            return hits[0]
     return None
 
 
 def load_split(split: str) -> pd.DataFrame:
-    """Load a MELD split CSV with normalized labels."""
     if split not in config.SPLITS:
         raise ValueError(f"split must be one of {config.SPLITS}")
     df = pd.read_csv(_find_csv(split))
@@ -101,7 +103,6 @@ def load_split(split: str) -> pd.DataFrame:
 
 
 def utterances_from_split(split: str) -> list[Utterance]:
-    """Materialize Utterance records with resolved media paths."""
     df = load_split(split)
     clips = clip_dir_for(split)
     out: list[Utterance] = []
@@ -127,29 +128,45 @@ def utterances_from_split(split: str) -> list[Utterance]:
 
 
 def class_weights(labels: list[int]) -> np.ndarray:
-    """Inverse-frequency class weights for the imbalanced 7-class problem."""
     counts = np.bincount(labels, minlength=len(config.EMOTIONS)).astype(np.float64)
     w = counts.sum() / (len(counts) * np.maximum(counts, 1.0))
     return w
 
 
-# ---------------------------------------------------------------------------
-# Audio extraction (ffmpeg, system dependency; see README)
-# ---------------------------------------------------------------------------
-def _extract_wav(video_path: Path, wav_path: Path) -> None:
+def extract_audio(video_path: Path, wav_path: Path, sr: int = 16000) -> bool:
+    """Decode an mp4's audio track in-process with PyAV and write a 16 kHz
+    mono wav. Returns False when the clip is undecodable or has no audio."""
+    import av
+    import soundfile as sf
+
     wav_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y", "-i", str(video_path),
-        "-vn", "-ac", "1", "-ar", "16000", str(wav_path),
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        container = av.open(str(video_path))
+    except Exception:
+        return False  # corrupt/truncated file (e.g. missing moov atom)
+    try:
+        if not container.streams.audio:
+            return False
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=sr)
+        chunks = []
+        for frame in container.decode(audio=0):
+            for resampled in resampler.resample(frame):
+                arr = resampled.to_ndarray()
+                chunks.append(np.asarray(arr).reshape(-1))
+        if not chunks:
+            return False
+        raw = np.concatenate(chunks).astype(np.float32) / 32768.0
+        sf.write(str(wav_path), raw, sr)
+        return True
+    except Exception:
+        return False
+    finally:
+        container.close()
 
 
 def ensure_audio_wavs(utterances: list[Utterance], workers: int = 8) -> list[Utterance]:
-    """Extract 16 kHz mono wavs for every utterance that has a video clip.
-    Idempotent: existing wavs are skipped, so it is safe to re-run."""
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg not found on PATH. Install it first (README has notes).")
+    """Extract 16 kHz mono wavs. Idempotent and fault-tolerant: corrupt
+    source clips are reported and treated as missing audio downstream."""
     todo = [
         u for u in utterances
         if u.video_path is not None and not u.wav_path.exists()
@@ -158,9 +175,16 @@ def ensure_audio_wavs(utterances: list[Utterance], workers: int = 8) -> list[Utt
         return utterances
     from concurrent.futures import ThreadPoolExecutor
 
+    failed = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(_extract_wav, u.video_path, u.wav_path) for u in todo]
-        for fut in futures:
-            fut.result()
-    print(f"Extracted {len(todo)} wavs to {config.PROCESSED_DIR}")
+        results = ex.map(lambda u: extract_audio(u.video_path, u.wav_path), todo)
+        for u, ok in zip(todo, results):
+            if not ok:
+                failed.append(u.uid)
+    print(f"Extracted {len(todo) - len(failed)}/{len(todo)} wavs to {config.PROCESSED_DIR}")
+    if failed:
+        print(
+            f"NOTE: {len(failed)} clips are unreadable (corrupt in the source "
+            f"data); they will be treated as missing audio. First few: {failed[:10]}"
+        )
     return utterances

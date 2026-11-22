@@ -13,6 +13,7 @@ dependencies = [
     "soundfile>=0.12",
     "opencv-python-headless>=4.10",
     "mediapipe>=0.10.14",
+    "av>=12",  # PyAV: wheel-bundled FFmpeg libs, pure-python mp4 audio decode
     "pandas>=2.2",
     "numpy>=1.26,<2.3",
     "scikit-learn>=1.5",
@@ -34,3 +35,10 @@ dev = []
 
 [tool.uv]
 package = true
+# mediapipe hard-depends on the GUI opencv builds (opencv-contrib-python),
+# which need libGL.so.1 and crash on headless Linux servers. This override
+# keeps contrib out of the Linux environment; mediapipe runs fine against our
+# direct opencv-python-headless dependency.
+override-dependencies = [
+    "opencv-contrib-python; sys_platform == 'darwin'",
+]
